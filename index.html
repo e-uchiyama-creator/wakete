@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WAKETE！ - 飲み会レシート割り勘ツール</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="app">
+  <header class="app-header">
+    <h1>🍻 WAKETE！</h1>
+    <p class="subtitle">レシート画像を読み込んで、お店ごとにわけて割り勘しよう</p>
+  </header>
+
+  <section class="card event-bar">
+    <div class="event-name-row">
+      <label class="event-name-label">イベント名
+        <input type="text" id="event-name-input" placeholder="例: 11/12 忘年会はしご" />
+      </label>
+      <button id="new-event-btn" class="btn btn-secondary">新しいイベントを始める</button>
+    </div>
+    <p class="hint event-hint">入力内容は自動的にこの端末に保存されます。3軒はしごするときは、1軒ごとに下の「結果」で保存してから次のお店の情報を入力してください。</p>
+  </section>
+
+  <main>
+    <!-- Step 1: Upload & OCR -->
+    <section class="card" id="step-upload">
+      <h2><span class="step-num">1</span> レシートを読み込む</h2>
+      <div class="upload-row">
+        <label class="upload-btn">
+          📷 画像を選択 / 撮影
+          <input type="file" id="receipt-input" accept="image/*" capture="environment" hidden />
+        </label>
+        <span id="ocr-status" class="ocr-status"></span>
+      </div>
+      <div id="ocr-progress-wrap" class="progress-wrap hidden">
+        <div id="ocr-progress-bar" class="progress-bar"></div>
+      </div>
+      <img id="receipt-preview" class="receipt-preview hidden" alt="レシートプレビュー" />
+      <details id="raw-text-details" class="hidden">
+        <summary>読み取った生テキストを見る</summary>
+        <pre id="raw-text"></pre>
+      </details>
+    </section>
+
+    <!-- Step 2: Items & charges -->
+    <section class="card" id="step-items">
+      <h2><span class="step-num">2</span> 品目と金額を確認・修正</h2>
+      <p class="hint">OCRの誤読があれば直接編集してください。品目は追加・削除もできます。</p>
+      <table class="items-table">
+        <thead>
+          <tr><th>品目名</th><th>金額(円)</th><th></th></tr>
+        </thead>
+        <tbody id="items-tbody"></tbody>
+      </table>
+      <button id="add-item-btn" class="btn btn-secondary">＋ 品目を追加</button>
+
+      <div class="charges-grid">
+        <label>小計(参考) <input type="text" id="charge-subtotal" readonly /></label>
+        <label>サービス料 <input type="number" id="charge-service" value="0" /></label>
+        <label>消費税 <input type="number" id="charge-tax" value="0" /></label>
+        <label>割引 <input type="number" id="charge-discount" value="0" /></label>
+        <label>レシート記載の合計(照合用) <input type="number" id="charge-receipt-total" placeholder="任意" /></label>
+      </div>
+    </section>
+
+    <!-- Step 3: Participants -->
+    <section class="card" id="step-people">
+      <h2><span class="step-num">3</span> 参加メンバー</h2>
+      <div class="people-input-row">
+        <input type="text" id="person-name-input" placeholder="名前を入力してEnter" />
+        <button id="add-person-btn" class="btn btn-secondary">追加</button>
+      </div>
+      <div id="people-chips" class="chips"></div>
+    </section>
+
+    <!-- Step 4: Split method -->
+    <section class="card" id="step-assign">
+      <h2><span class="step-num">4</span> 割り勘方法</h2>
+      <div class="mode-toggle">
+        <button id="mode-items-btn" class="mode-btn is-active" data-mode="items">品目ごとに割り当て</button>
+        <button id="mode-weighted-btn" class="mode-btn" data-mode="weighted">人数が多い時用(一律・傾斜配分)</button>
+      </div>
+
+      <div id="mode-items-panel">
+        <p class="hint">品目ごとに注文した人をチェック。複数人で分けたものは全員チェックでOK。</p>
+        <div id="assign-table-wrap"></div>
+      </div>
+
+      <div id="mode-weighted-panel" class="hidden">
+        <p class="hint">品目を個別に確認できない人数の時向け。役職や立場に応じて比率(傾斜)をつけるか、全員同じ比率にすれば均等割りになります。</p>
+        <button id="reset-weights-btn" class="btn btn-secondary">全員同じ比率(1.0)にリセット</button>
+        <div id="weighted-list" class="weighted-list"></div>
+      </div>
+    </section>
+
+    <!-- Step 5: Result -->
+    <section class="card" id="step-result">
+      <h2><span class="step-num">5</span> このお店の結果</h2>
+      <div id="verify-banner" class="hidden"></div>
+      <div id="result-list" class="result-list"></div>
+      <div class="result-actions">
+        <button id="copy-result-btn" class="btn btn-primary">結果をコピー</button>
+        <span id="copy-feedback" class="copy-feedback"></span>
+      </div>
+
+      <div class="save-store-row">
+        <input type="text" id="store-label-input" placeholder="お店の名前(例: 1軒目 居酒屋さくら)" />
+        <button id="save-store-btn" class="btn btn-primary">📌 このお店を保存して次へ</button>
+      </div>
+    </section>
+
+    <!-- Step 6: Saved stores for this event -->
+    <section class="card" id="step-stores">
+      <h2><span class="step-num">6</span> 保存済みのお店 / この日の合計</h2>
+      <div id="stores-list" class="stores-list"></div>
+      <div id="event-total-wrap" class="hidden">
+        <h3 class="event-total-heading">この日の合計</h3>
+        <div id="event-total-list" class="result-list"></div>
+        <div class="result-actions">
+          <button id="copy-event-total-btn" class="btn btn-primary">合計をコピー</button>
+          <span id="copy-event-feedback" class="copy-feedback"></span>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
