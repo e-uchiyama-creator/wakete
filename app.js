@@ -103,41 +103,52 @@ function loadImageSource(file) {
   });
 }
 
-// Otsu's method: finds the grayscale threshold that best separates
-// dark text from a light background.
-function otsuThreshold(gray) {
-  const hist = new Array(256).fill(0);
-  for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
-
-  const total = gray.length;
-  let sum = 0;
-  for (let t = 0; t < 256; t++) sum += t * hist[t];
-
-  let sumB = 0;
-  let wB = 0;
-  let maxVariance = 0;
-  let threshold = 127;
-
-  for (let t = 0; t < 256; t++) {
-    wB += hist[t];
-    if (wB === 0) continue;
-    const wF = total - wB;
-    if (wF === 0) break;
-    sumB += t * hist[t];
-    const mB = sumB / wB;
-    const mF = (sum - sumB) / wF;
-    const variance = wB * wF * (mB - mF) * (mB - mF);
-    if (variance > maxVariance) {
-      maxVariance = variance;
-      threshold = t;
+// Bradley's adaptive thresholding: instead of one global cutoff for the whole
+// photo, each pixel is compared against the average brightness of its local
+// neighborhood (via an integral image for O(1) window sums). This is what
+// makes it robust to the uneven lighting and shadows/creases you get on a
+// real phone photo of a receipt, where a single global threshold (e.g. Otsu)
+// blows out one side of the image while crushing the other to black.
+function adaptiveThreshold(gray, width, height) {
+  const integral = new Float64Array(width * height);
+  for (let y = 0; y < height; y++) {
+    let rowSum = 0;
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      rowSum += gray[idx];
+      integral[idx] = rowSum + (y > 0 ? integral[idx - width] : 0);
     }
   }
-  return threshold;
+
+  const half = Math.max(8, Math.floor(width * 0.05));
+  const sensitivity = 0.15;
+  const out = new Uint8ClampedArray(width * height);
+
+  for (let y = 0; y < height; y++) {
+    const y1 = Math.max(0, y - half);
+    const y2 = Math.min(height - 1, y + half);
+    for (let x = 0; x < width; x++) {
+      const x1 = Math.max(0, x - half);
+      const x2 = Math.min(width - 1, x + half);
+      const count = (x2 - x1 + 1) * (y2 - y1 + 1);
+
+      const sum =
+        integral[y2 * width + x2] -
+        (x1 > 0 ? integral[y2 * width + x1 - 1] : 0) -
+        (y1 > 0 ? integral[(y1 - 1) * width + x2] : 0) +
+        (x1 > 0 && y1 > 0 ? integral[(y1 - 1) * width + x1 - 1] : 0);
+      const localMean = sum / count;
+
+      const idx = y * width + x;
+      out[idx] = gray[idx] < localMean * (1 - sensitivity) ? 0 : 255;
+    }
+  }
+  return out;
 }
 
-// Grayscale + upscale (if small) + Otsu binarization. Receipt photos are
-// often low-contrast or dim, and Tesseract reads a crisp black-on-white
-// scan far more reliably than a raw color photo.
+// Grayscale + upscale (if small) + adaptive binarization. Receipt photos are
+// often dim, low-contrast, or unevenly lit, and Tesseract reads a crisp
+// black-on-white scan far more reliably than a raw color photo.
 async function preprocessReceiptImage(file) {
   const source = await loadImageSource(file);
   const srcWidth = source.width;
@@ -162,9 +173,9 @@ async function preprocessReceiptImage(file) {
     gray[j] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
   }
 
-  const threshold = otsuThreshold(gray);
+  const binarized = adaptiveThreshold(gray, canvas.width, canvas.height);
   for (let i = 0, j = 0; i < data.length; i += 4, j++) {
-    const v = gray[j] >= threshold ? 255 : 0;
+    const v = binarized[j];
     data[i] = v;
     data[i + 1] = v;
     data[i + 2] = v;
