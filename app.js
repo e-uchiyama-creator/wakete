@@ -89,27 +89,127 @@ const rawTextEl = document.getElementById("raw-text");
 
 const OCR_TIMEOUT_MS = 45000;
 
+// Loads a File/Blob as a drawable image, with a fallback for browsers
+// without createImageBitmap support.
+function loadImageSource(file) {
+  if (window.createImageBitmap) {
+    return createImageBitmap(file);
+  }
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+// Otsu's method: finds the grayscale threshold that best separates
+// dark text from a light background.
+function otsuThreshold(gray) {
+  const hist = new Array(256).fill(0);
+  for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+
+  const total = gray.length;
+  let sum = 0;
+  for (let t = 0; t < 256; t++) sum += t * hist[t];
+
+  let sumB = 0;
+  let wB = 0;
+  let maxVariance = 0;
+  let threshold = 127;
+
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF === 0) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const variance = wB * wF * (mB - mF) * (mB - mF);
+    if (variance > maxVariance) {
+      maxVariance = variance;
+      threshold = t;
+    }
+  }
+  return threshold;
+}
+
+// Grayscale + upscale (if small) + Otsu binarization. Receipt photos are
+// often low-contrast or dim, and Tesseract reads a crisp black-on-white
+// scan far more reliably than a raw color photo.
+async function preprocessReceiptImage(file) {
+  const source = await loadImageSource(file);
+  const srcWidth = source.width;
+  const srcHeight = source.height;
+
+  const MIN_WIDTH = 1600;
+  const MAX_SCALE = 2;
+  const scale = srcWidth < MIN_WIDTH ? Math.min(MAX_SCALE, MIN_WIDTH / srcWidth) : 1;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(srcWidth * scale);
+  canvas.height = Math.round(srcHeight * scale);
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const { data } = imageData;
+  const gray = new Uint8ClampedArray(canvas.width * canvas.height);
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+    gray[j] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+  }
+
+  const threshold = otsuThreshold(gray);
+  for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+    const v = gray[j] >= threshold ? 255 : 0;
+    data[i] = v;
+    data[i + 1] = v;
+    data[i + 2] = v;
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("画像の前処理に失敗しました"))), "image/png");
+  });
+}
+
 receiptInput.addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
 
-  const url = URL.createObjectURL(file);
-  receiptPreview.src = url;
-  receiptPreview.classList.remove("hidden");
-
   if (typeof Tesseract === "undefined") {
+    const url = URL.createObjectURL(file);
+    receiptPreview.src = url;
+    receiptPreview.classList.remove("hidden");
     ocrStatus.textContent =
       "⚠️ OCRライブラリを読み込めませんでした。file://形式やネット接続が原因の可能性があります。下の「＋品目を追加」から手動で入力してください";
     return;
   }
 
-  ocrStatus.textContent = "読み取り準備中...";
+  ocrStatus.textContent = "画像を補正中...";
   progressWrap.classList.remove("hidden");
   progressBar.style.width = "0%";
 
+  let ocrSource = file;
+  try {
+    const processedBlob = await preprocessReceiptImage(file);
+    ocrSource = processedBlob;
+    receiptPreview.src = URL.createObjectURL(processedBlob);
+  } catch (err) {
+    console.error("前処理に失敗したため、元画像のまま読み取ります", err);
+    receiptPreview.src = URL.createObjectURL(file);
+  }
+  receiptPreview.classList.remove("hidden");
+
+  ocrStatus.textContent = "読み取り準備中...";
+
   try {
     const result = await Promise.race([
-      Tesseract.recognize(file, "jpn+eng", {
+      Tesseract.recognize(ocrSource, "jpn+eng", {
+        tessedit_pageseg_mode: "6",
         logger: (m) => {
           if (m.status === "recognizing text") {
             const pct = Math.round(m.progress * 100);
@@ -160,52 +260,87 @@ function parseReceiptText(text) {
     .map((l) => l.trim())
     .filter(Boolean);
 
-  const priceRe = /([0-9][0-9,]{1,})\s*円?\s*$/;
+  // Real receipts often suffix amounts with "内" (tax-inclusive marker), not just "円".
+  const priceRe = /([0-9][0-9,]{1,})\s*(?:円|内)?\s*$/;
   const subtotalKw = /小計|^subtotal/i;
-  const taxKw = /消費税|内税|外税|^tax/i;
+  // Tax is almost always already included in Japanese izakaya/restaurant prices,
+  // and the same tax amount often gets restated 2-3 times on one receipt (内税額,
+  // 消費税等, ...). Treating any tax line as additive risks double-counting it on
+  // top of a subtotal that already includes it, so tax lines are informational only.
+  const taxInfoKw = /消費税|内税|外税|税抜|税込|^tax/i;
   const serviceKw = /サービス料|サ料|service/i;
   const totalKw = /^合計|お会計|ご請求|total$/i;
-  const skipKw = /お預|お釣|point|ポイント|電話|tel|レシート|領収|^\d{1,2}[:：]\d{2}$|^\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}/i;
+  // Receipt/order numbers, phone numbers, addresses, seat counts, etc. must never
+  // be treated as items - their trailing digits look exactly like a price otherwise.
+  const skipKw =
+    /預|お釣|point|ポイント|電話|tel|レシート|領収|点数|人数|伝票|テーブル|担当|受付|No[.:]?\s*\d|\d+-\d+-\d+|\d{4}年\d{1,2}月\d{1,2}日|^\d{1,2}[:：]\d{2}$|^\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}/i;
+  // A line like "@500x2" or "@250x5" is a unit-price/quantity annotation, not an
+  // item name - when it's the one carrying the price, the real name is usually
+  // on the previous (wrapped) line instead.
+  const unitPriceOnlyRe = /^[@×x]/i;
 
   const items = [];
   let tax = null;
   let service = null;
   let total = null;
+  let pendingName = null;
 
   for (const rawLine of lines) {
     const line = rawLine.replace(/\s+/g, " ");
     // Tesseract often inserts spaces between every CJK character, so keyword
     // matching needs a whitespace-free view of the line.
     const compact = line.replace(/\s+/g, "");
-    if (skipKw.test(compact)) continue;
+    if (skipKw.test(compact) || skipKw.test(line)) {
+      continue;
+    }
 
     const m = line.match(priceRe);
-    if (!m) continue;
+    if (!m) {
+      // No price on this line - it might be an item name that wraps onto the
+      // next line (common when a quantity/price column pushes the name out).
+      pendingName = line.length > 0 && line.length < 40 ? line : null;
+      continue;
+    }
 
     const price = parseInt(m[1].replace(/,/g, ""), 10);
-    if (!Number.isFinite(price) || price <= 0) continue;
+    if (!Number.isFinite(price) || price <= 0) {
+      pendingName = null;
+      continue;
+    }
 
-    const namePart = line
+    let namePart = line
       .slice(0, m.index)
       .trim()
-      .replace(/[\s.・*]+$/, "")
-      .replace(/\s+/g, "");
+      .replace(/[\s.・*¥￥]+$/, "");
+    // Strip a trailing quantity column, e.g. "飲み放題 2" -> "飲み放題".
+    const qtyMatch = namePart.match(/^(.+?)\s+\d{1,2}$/);
+    if (qtyMatch) namePart = qtyMatch[1];
+    namePart = namePart.replace(/\s+/g, "");
 
     if (totalKw.test(compact)) {
       total = price;
+      pendingName = null;
       continue;
     }
-    if (taxKw.test(compact)) {
-      tax = price;
-      continue;
+    if (taxInfoKw.test(compact)) {
+      pendingName = null;
+      continue; // shown for reference only; never added on top of the subtotal
     }
     if (serviceKw.test(compact)) {
       service = price;
+      pendingName = null;
       continue;
     }
     if (subtotalKw.test(compact)) {
+      pendingName = null;
       continue; // informational only, recomputed from items
     }
+
+    if ((!namePart || unitPriceOnlyRe.test(namePart)) && pendingName) {
+      namePart = pendingName;
+    }
+    pendingName = null;
+
     if (!namePart || namePart.length < 1) continue;
     if (price > 100000) continue; // guard against misreads
 
